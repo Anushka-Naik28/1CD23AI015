@@ -206,7 +206,7 @@ To deliver notifications instantly to online users, we will use **WebSockets** (
           auth: { token: "Bearer ACCESS_TOKEN" }
         });
         ```
-    *   The server intercepts the connection, validates the JWT, and extracts the `userId`.
+    *   `token` will be decoded at server middleware layer, identifying the `userId`.
 2.  **Room Joining:**
     *   Upon successful authentication, the server adds the socket to a private room specific to the user (`user_room_<userId>`). This allows targeting a specific user across multiple active tabs/devices.
 3.  **Pushing Events:**
@@ -380,3 +380,77 @@ Below are the MongoDB queries corresponding to each Stage 1 API endpoint:
       { upsert: true }
     );
     ```
+
+---
+
+## Stage 3: Relational DB Query Analysis & SQL Optimization
+
+### 1. Analysis of the Relational Query
+The query under evaluation is:
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt ASC;
+```
+
+#### **A. Is this query accurate?**
+**Yes.** Syntactically and logically, the query is correct. It successfully fetches all unread (`isRead = false`) notifications for the student with ID `1042` and sorts them in ascending chronological order of creation.
+
+#### **B. Why is this query slow?**
+At a data scale of **5,000,000 notifications**:
+1.  **Full Table Scan (Sequential Scan):** Without an index on `studentID` or `isRead`, the relational database engine cannot perform a targeted lookup. Instead, it must read all 5,000,000 rows from disk into memory to evaluate which rows match `studentID = 1042` and `isRead = false`.
+2.  **In-Memory Sorting (Filesort):** Because the query requests `ORDER BY createdAt ASC` on unindexed data, the database engine must fetch all matching records, load them into a temporary buffer (in-memory or on-disk), and perform a sort operation, incurring heavy CPU utilization.
+
+---
+
+### 2. Suggested Optimization & Computational Cost
+
+#### **A. The Solution: Compound Index**
+We should create a **Compound Index** on the combination of columns:
+```sql
+CREATE INDEX idx_student_unread_created ON notifications (studentID, isRead, createdAt);
+```
+
+*   **Why this specific order?**
+    It adheres to the **ESR (Equality, Sort, Range)** indexing principle:
+    1.  `studentID` (Equality) - First column filters by exact student ID.
+    2.  `isRead` (Equality) - Second column filters by exact boolean status.
+    3.  `createdAt` (Sort) - Storing these in sorted order within the index allows the DB to bypass the sort computation step completely.
+
+#### **B. Computation Cost Comparison**
+
+| Metric | Before Indexing (Full Table Scan) | After Compound Index |
+| :--- | :--- | :--- |
+| **Search Complexity** | **O(N)** where $N = 5,000,000$. The database performs a sequential scan of all records. | **O(log N + K)** where $\log N$ represents the B-Tree height search (typically 3-4 disk seek operations) and $K$ is the number of matching records. |
+| **Sort Complexity** | **O(M log M)** where $M$ is the number of notifications matching `studentID = 1042`. It requires a sorting step. | **O(1)** (Negligible). The database scans the B-Tree index leaf nodes, which are already stored in sorted order. |
+
+---
+
+### 3. Evaluating "Index Every Column" Advice
+The teammate’s advice to "add indexes on every column to be safe" is **highly ineffective and dangerous** in production.
+
+#### **Why/Why not?**
+*   **Write Penalty:** Every write operation (`INSERT`, `UPDATE`, `DELETE`) requires the database to update the corresponding index structures. Having too many indexes turns simple insert operations into sluggish, resource-heavy operations.
+*   **Storage & Memory Bloat:** Indexes must fit into the database cache (RAM) to be effective. Indexing every column bloats memory usage, which pushes pages out of RAM and causes heavy disk I/O (paging/thrashing), degrading overall read speed.
+*   **Optimizer Confusion:** Query planners evaluate which index to use. Having multiple single-column indexes can confuse the optimizer, causing it to merge indexes inefficiently rather than selecting the best single compound index.
+
+---
+
+### 4. Query: Placement Notifications in the Last 7 Days
+To find all distinct students who received a `"Placement"` notification in the last 7 days:
+
+#### **MySQL Dialect:**
+```sql
+SELECT DISTINCT studentID 
+FROM notifications
+WHERE notificationType = 'Placement'
+  AND createdAt >= NOW() - INTERVAL 7 DAY;
+```
+
+#### **PostgreSQL Dialect:**
+```sql
+SELECT DISTINCT studentID 
+FROM notifications
+WHERE notificationType = 'Placement'
+  AND createdAt >= NOW() - INTERVAL '7 days';
+```
