@@ -518,7 +518,7 @@ Throttle client API calls directly on the front-end application layer.
 
 ## Stage 5: Mass Dispatch System Design
 
-### 1. Critique of the Proposed Pseudocode
+### 1. Critique & Shortcomings of the Synchronous Code
 The proposed implementation of `notify_all` is as follows:
 ```python
 function notify_all(student_ids: array, message: string):
@@ -528,43 +528,135 @@ function notify_all(student_ids: array, message: string):
         push_to_app(student_id, message)  # WebSocket push
 ```
 
-At a scale of **50,000 students**, this code has several severe architectural flaws:
+At a scale of **50,000 students**, the following issues will manifest:
 
-1.  **Synchronous Blocking (Event Loop Block):** 
-    Processing 50,000 records sequentially in a loop will completely block the thread (or event loop in Node.js). If a single iteration (sending an email, writing to the DB, and pushing to WS) takes a modest `300ms`, the total execution time will be `50,000 * 0.3s = 15,000 seconds (4.16 hours)`. The HTTP thread triggers an API timeout, leaving the HR user in a frozen UI state.
-2.  **Database Connection & Write Exhaustion:** 
-    Executing 50,000 individual `INSERT` commands one-by-one is highly inefficient. It floods the database connection pool, spikes CPU usage, and can bring the database down.
-3.  **Third-Party API Rate Limits:** 
-    External Email service APIs (like SendGrid, Mailgun, or AWS SES) will immediately rate-limit, throttle, or block your server's IP address if it receives 50,000 sequential API requests in a raw loop.
-4.  **No Failure Tolerance (Lack of Atomicity):** 
-    If the server crashes or an exception is thrown on student #25,000, the process terminates. There is no progress tracking. Re-running the function would send duplicate notifications to the first 24,999 students, causing a terrible user experience.
+1.  **Blockages & Timeouts (High Latency):** 
+    Each iteration in the loop performs synchronous actions. If a single student takes `300ms` (network call to Email API + DB insert + socket write), the entire loop takes `50,000 * 0.3s = 15,000 seconds (4.16 hours)`. The calling HTTP thread will timeout and crash long before finishing, leaving the client in a broken state.
+2.  **Lack of Resiliency (The "200 Failed mid-way" Scenario):** 
+    If `send_email` fails for 200 students midway, the script throws an error and stops execution, leaving the state split. Some students got the email, some didn't. Re-running the script will send duplicate emails to everyone who already received them. There is no trace of which student failed and who succeeded.
+3.  **Database Connection Exhaustion:** 
+    Running 50,000 sequential inserts puts continuous write locking strain on the DB, slowing down read operations for all other online students.
+4.  **API Rate Limiting:** 
+    Third-party email dispatch providers (e.g. AWS SES, SendGrid) enforce rate limits. Sending 50,000 unthrottled sequential HTTP calls will trigger a rate-limit error (e.g., `429 Too Many Requests`) or cause IP blocking.
 
 ---
 
-### 2. Proposed Production-Grade Architecture
+### 2. Transaction Decoupling: Should DB Inserts and Email Dispatch Happen Together?
+**No. They must be decoupled.**
 
-To execute a mass dispatch safely and reliably, we must pivot to an **Asynchronous Queue-Based Architecture**:
+*   **Why they should not happen together:**
+    1.  **Fault Isolation:** The core application feature is the in-app notification. If the external Email Service provider is down, it should *never* prevent the system from registering the notification in the database and pushing it to the student's dashboard.
+    2.  **Speed Difference:** Database writes take microseconds; HTTP mail requests take hundreds of milliseconds. Tying them together degrades the entire application performance to the speed of the mail server.
+*   **The Decoupling Design:**
+    Write to the database and emit the WebSocket push immediately (critical path, fast). Push the email job to an asynchronous queue (non-critical path, slow).
 
-```mermaid
-graph TD
-    HR[HR Client Dashboard] -- 1. Trigger POST /api/notify-all --> WebServer[Express API Server]
-    WebServer -- 2. Bulk Insert 50,000 DB records --> DB[(MongoDB Database)]
-    WebServer -- 3. Push Job Payload to Redis --> Queue[(Redis / Message Queue)]
-    WebServer -- 4. Instant 202 Accepted Response --> HR
-    Queue -- 5. Poll in Batches --> Workers[Background Worker Nodes]
-    Workers -- 6. Send Emails in parallel with throttling --> EmailService[Third-Party Email API]
-    Workers -- 7. Send Real-Time Socket Pushes --> WS[Socket.io Server]
+---
+
+### 3. Redesigned Queue-Based Pseudocode (Reliable & Fast)
+
+To achieve fault-tolerance and scale, we partition the job into **Producer** and **Consumer** models:
+
+#### **Producer Code (Web Server Node)**
+```python
+# HR triggers "Notify All"
+function handle_notify_all_request(student_ids: array, message: string):
+    # 1. Bulk Insert notifications to DB in a single bulk operation
+    notifications_data = []
+    for student_id in student_ids:
+        notifications_data.append({
+            "student_id": student_id,
+            "message": message,
+            "status": "unread",
+            "createdAt": current_timestamp()
+        })
+    bulk_insert_to_db(notifications_data)  # Done in 1 query (~100ms)
+
+    # 2. Enqueue a single parent dispatch job into Redis Queue
+    queue_broker.push("mass_dispatch_job", {
+        "student_ids": student_ids,
+        "message": message
+    })
+
+    # 3. Respond instantly to HR client (No blocking!)
+    return HTTP_202_ACCEPTED({"message": "Mass notification queued successfully."})
 ```
 
-#### **Core Pillars of the Optimized System:**
-1.  **Asynchronous De-coupling:** 
-    When HR clicks "Notify All", the Web Server immediately enqueues the dispatch job into a task manager (e.g., Redis-backed **BullMQ**) and returns a `202 Accepted` status response within milliseconds.
-2.  **Bulk Database Operations:** 
-    Instead of 50,000 separate DB insertions, compile a single array and perform a single bulk insert:
-    ```javascript
-    db.notifications.insertMany(bulkNotificationsArray); // Done in seconds
-    ```
-3.  **Worker Concurrency & Rate Limiting:** 
-    Background workers consume jobs from the queue and send emails in parallel batches (e.g., 50 concurrent dispatches) with a defined rate limit (e.g., 100 emails/second) matching the API's constraints.
-4.  **Idempotency & Retry Mechanism:** 
-    If sending an email to a student fails, only that specific student's task is re-queued with exponential backoff. The job logs successes in the database so that if the worker server restarts, it picks up exactly where it left off without duplicating success states.
+#### **Consumer/Worker Code (Background Workers)**
+```python
+# Worker picks up the parent job and chunks it
+function process_mass_dispatch_job(job):
+    student_ids = job.data.student_ids
+    message = job.data.message
+    
+    # Split into batches of 100 to process in parallel
+    batches = chunk_array(student_ids, size=100)
+    for batch in batches:
+        # Create individual task for each student within the batch
+        tasks = []
+        for student_id in batch:
+            tasks.append({
+                "student_id": student_id,
+                "message": message,
+                "retry_count": 0
+            })
+        
+        # Enqueue individual student notification tasks to 'delivery_queue'
+        delivery_queue.push_bulk(tasks)
+
+# Worker consumer for individual delivery tasks
+function process_delivery_task(task):
+    student_id = task.data.student_id
+    message = task.data.message
+    
+    try:
+        # 1. Dispatch Email (external API call)
+        send_email(student_id, message)
+        
+        # 2. Push WebSocket notification if student is currently online
+        push_to_websocket_room(f"user_room_{student_id}", {
+            "message": message,
+            "createdAt": current_timestamp()
+        })
+    except EmailAPIError as e:
+        # Fault Tolerance: If email fails for this student, retry up to 3 times
+        if task.data.retry_count < 3:
+            task.data.retry_count += 1
+            # Requeue with Exponential Backoff
+            delivery_queue.push_delayed(task, delay=2 ** task.data.retry_count)
+        else:
+            # Move to Dead Letter Queue for HR reporting
+            dead_letter_queue.push(task, error=str(e))
+```
+
+---
+
+## Stage 6: Priority Inbox Implementation
+
+### 1. The Priority Algorithm & Sorting Model
+To display the top `n` most important unread notifications, we rank them based on a combination of **weight** and **recency**.
+
+*   **Type Weights:**
+    *   `Placement` = Weight 3 (highest)
+    *   `Result` = Weight 2
+    *   `Event` = Weight 1
+
+*   **Hierarchical Sorting Rationale:**
+    To ensure critical notices are never buried under generic events, we apply a strict hierarchical sorting strategy:
+    1.  **Primary Sort:** Sort by Type Weight descending (`Placement` > `Result` > `Event`).
+    2.  **Secondary Sort:** Sort by Timestamp descending (recency).
+    This guarantees that all unread placement notices are shown first (ordered newest to oldest), followed by results, and finally events.
+
+---
+
+### 2. Scalability: Efficient Top-10 Maintenance at Scale
+If the database receives a constant influx of notifications, reloading all notifications from the database and sorting them is an $O(N \log N)$ operation that will fail at scale.
+
+To maintain the **Top-10** dynamically and efficiently:
+*   **The Min-Heap Strategy:**
+    We maintain a **Min-Heap (Priority Queue)** of size $K = 10$ in the application memory (or in a fast cache layer like Redis Sorted Sets).
+    *   The root of the Min-Heap always represents the *lowest priority* notification in the current top-10 list.
+    *   **When a new notification arrives:**
+        1. Compare its priority with the root of the heap.
+        2. If its priority is higher than the root, pop the root and push the new notification.
+        3. Re-balance the heap.
+    *   **Time Complexity:** Maintains the top-10 in **$O(\log K)$** time (constant time of $\approx 3$ operations since $K = 10$) instead of re-sorting all $N$ elements, which would take $O(N \log N)$ time.
